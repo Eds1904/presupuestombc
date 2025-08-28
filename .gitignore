@@ -1,0 +1,23 @@
+# Evitar subir secretos de Streamlit
+.streamlit/secrets.toml
+
+# Archivos compilados de Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Archivos de entorno / configuración local
+.env
+.venv
+env/
+venv/
+
+# Archivos temporales de Jupyter/VSCode
+.ipynb_checkpoints
+.vscode/
+.idea/
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
