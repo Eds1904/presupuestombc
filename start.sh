@@ -3,7 +3,7 @@ set -e
 
 mkdir -p .streamlit
 
-# Render suele guardar PRIVATE_KEY con \n. Los convertimos a nuevas líneas reales:
+# Render suele guardar PRIVATE_KEY con \n. Los convertimos a saltos reales:
 GCP_PRIVATE_KEY_FIXED="$(printf '%b' "$GCP_PRIVATE_KEY")"
 
 cat > .streamlit/secrets.toml <<EOF
@@ -20,4 +20,4 @@ token_uri = "https://oauth2.googleapis.com/token"
 folder_id = "$DRIVE_FOLDER_ID"
 EOF
 
-exec streamlit run wappmbc.py --server.port "\$PORT" --server.address 0.0.0.0
+exec streamlit run wappmbc.py --server.port "$PORT" --server.address 0.0.0.0
