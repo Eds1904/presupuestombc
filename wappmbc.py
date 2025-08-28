@@ -1,10 +1,8 @@
-# -*- coding: utf-8 -*-
-# app.py — Gestión de Flujos Financieros con persistencia Google Drive (fallback local)
-# Compatible con Python 3.8/3.9/3.11
-
 import os
 import io
+import sys
 import json
+import logging
 from typing import Optional, Tuple, Dict
 
 import pandas as pd
@@ -12,6 +10,28 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 from datetime import date, datetime
+
+# ======== LOGGING / CHECKPOINTS ========
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+    stream=sys.stderr,
+)
+
+def log(msg: str):
+    """Manda log a stderr y lo guarda para mostrar en la UI."""
+    try:
+        logging.info(msg)
+        st.session_state.setdefault("_logs", []).append(f"[{pd.Timestamp.now().strftime('%H:%M:%S')}] {msg}")
+    except Exception:
+        pass
+
+# Mostrar siempre algo rápido para evitar “pantalla en blanco”
+st.set_page_config(page_title="📊 Gestión de Flujos", layout="wide")
+st.title("📊 Gestión de Flujos Financieros")
+st.caption("✅ checkpoint: front levantó")
+st.set_option("client.showErrorDetails", True)
+log("UI inicial pintada.")
 
 # ============ CONFIG ============
 FILE_ESTIMADOS = "estimados.csv"
@@ -26,23 +46,24 @@ CATEGORIAS = ["Licencia", "Infraestructura", "Despliegue", "Otros"]
 MESES_ES = ["Enero","Febrero","Marzo","Abril","Mayo","Junio","Julio","Agosto","Septiembre","Octubre","Noviembre","Diciembre"]
 MES_ABR_ES = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"]  # abreviado para ejes
 
-st.set_page_config(page_title="📊 Gestión de Flujos", layout="wide")
-st.title("📊 Gestión de Flujos Financieros")
-
 # ============ HELPERS: IO / PREFS ============
 def load_prefs(path: str) -> Dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+            prefs = json.load(f)
+        log(f"Preferencias cargadas desde {path}.")
+        return prefs
+    except Exception as e:
+        log(f"Sin preferencias previas ({e}).")
         return {}
 
 def save_prefs(path: str, prefs: Dict) -> None:
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(prefs, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
+        log(f"Preferencias guardadas en {path}.")
+    except Exception as e:
+        log(f"ERROR guardando preferencias: {e}")
 
 # ====== PERSISTENCIA EN GOOGLE DRIVE (CSV) con fallback local ======
 # Detectar si hay secrets (evita crash local)
@@ -52,6 +73,8 @@ except Exception:
     HAS_SECRETS = False
 
 USE_DRIVE = False
+_DRIVE_IMPORT_ERROR = None
+
 if HAS_SECRETS:
     try:
         USE_DRIVE = ("gcp" in st.secrets) and ("drive" in st.secrets) and bool(st.secrets["drive"].get("folder_id"))
@@ -59,80 +82,99 @@ if HAS_SECRETS:
         USE_DRIVE = False
 
 if USE_DRIVE:
-    from googleapiclient.discovery import build
-    from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
-    from google.oauth2.service_account import Credentials
+    try:
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+        from google.oauth2.service_account import Credentials
+        log("Dependencias de Google API importadas correctamente.")
+    except Exception as e:
+        _DRIVE_IMPORT_ERROR = str(e)
+        USE_DRIVE = False
+        log(f"ERROR importando Google API libs, deshabilito Drive: {e}")
 
-    @st.cache_resource(show_spinner=False)
-    def _drive_service():
-        creds_info = dict(st.secrets["gcp"])
-        scopes = ["https://www.googleapis.com/auth/drive"]
-        credentials = Credentials.from_service_account_info(creds_info, scopes=scopes)
-        return build("drive", "v3", credentials=credentials)
+@st.cache_resource(show_spinner=False)
+def _drive_service():
+    """Crea el servicio de Drive (cacheado)."""
+    creds_info = dict(st.secrets["gcp"])
+    scopes = ["https://www.googleapis.com/auth/drive"]
+    credentials = Credentials.from_service_account_info(creds_info, scopes=scopes)
+    return build("drive", "v3", credentials=credentials)
 
-    def _find_file(service, name, parent_id):
-        # sanitizar comillas para query
-        q_name = name.replace("'", "")
-        q = f"name = '{q_name}' and '{parent_id}' in parents and trashed = false"
-        r = service.files().list(q=q, fields="files(id, name)", pageSize=1).execute()
-        files = r.get("files", [])
-        return files[0]["id"] if files else None
+def _find_file(service, name, parent_id):
+    """Busca archivo por nombre exacto en carpeta."""
+    q_name = name.replace("'", "")
+    q = f"name = '{q_name}' and '{parent_id}' in parents and trashed = false"
+    r = service.files().list(q=q, fields="files(id, name)", pageSize=1).execute()
+    files = r.get("files", [])
+    return files[0]["id"] if files else None
 
-    def load_drive_csv(name: str, cols):
-        service = _drive_service()
-        folder_id = st.secrets["drive"]["folder_id"]
-        file_id = _find_file(service, name, folder_id)
-        if not file_id:
-            return pd.DataFrame(columns=cols)
-        req = service.files().get_media(fileId=file_id)
-        buf = io.BytesIO()
-        downloader = MediaIoBaseDownload(buf, req)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-        buf.seek(0)
-        df = pd.read_csv(buf)
-        df = normalize_columns(df)
-        for c in cols:
-            if c not in df.columns:
-                df[c] = 0.0 if c in ("Monto","Valor") else ""
-        if "Fecha" in df.columns:
-            df["Fecha"] = df["Fecha"].apply(try_parse_month)
-        return df[cols]
+def load_drive_csv(name: str, cols):
+    service = _drive_service()
+    folder_id = st.secrets["drive"]["folder_id"]
+    file_id = _find_file(service, name, folder_id)
+    if not file_id:
+        log(f"[Drive] No existe {name}, devuelvo DF vacío con columnas esperadas.")
+        return pd.DataFrame(columns=cols)
 
-    def save_drive_csv(df: pd.DataFrame, name: str):
-        service = _drive_service()
-        folder_id = st.secrets["drive"]["folder_id"]
-        file_id = _find_file(service, name, folder_id)
+    req = service.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, req)
 
-        out = df.copy()
-        if "Fecha" in out.columns:
-            out["Fecha"] = pd.to_datetime(out["Fecha"], errors="coerce").dt.strftime(CSV_DATE_FMT)
-        buf = io.BytesIO()
-        out.to_csv(buf, index=False)
-        buf.seek(0)
+    # Evitar loops infinitos (máx 50 chunks con reintentos)
+    done = False
+    for _ in range(50):
+        status, done = downloader.next_chunk(num_retries=2)
+        if done:
+            break
+    if not done:
+        raise RuntimeError(f"Descarga de Drive no concluyó para {name} (timeout de chunks).")
 
-        media = MediaIoBaseUpload(buf, mimetype="text/csv", resumable=True)
-        if file_id:
-            service.files().update(fileId=file_id, media_body=media).execute()
-        else:
-            meta = {"name": name, "parents": [folder_id], "mimeType": "text/csv"}
-            service.files().create(body=meta, media_body=media, fields="id").execute()
+    buf.seek(0)
+    df = pd.read_csv(buf)
+    df = normalize_columns(df)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = 0.0 if c in ("Monto","Valor") else ""
+    if "Fecha" in df.columns:
+        df["Fecha"] = df["Fecha"].apply(try_parse_month)
+    log(f"[Drive] {name} cargado. Filas: {len(df)}")
+    return df[cols]
 
-    def upload_to_drive_from_filelike(file, target_name: str):
-        """Sube un archivo CSV (file-like) a la carpeta, reemplazando si existe."""
-        service = _drive_service()
-        folder_id = st.secrets["drive"]["folder_id"]
-        file_id = _find_file(service, target_name, folder_id)
-        data = file.read()
-        buf = io.BytesIO(data)
-        buf.seek(0)
-        media = MediaIoBaseUpload(buf, mimetype="text/csv", resumable=True)
-        if file_id:
-            service.files().update(fileId=file_id, media_body=media).execute()
-        else:
-            meta = {"name": target_name, "parents": [folder_id], "mimeType": "text/csv"}
-            service.files().create(body=meta, media_body=media, fields="id").execute()
+def save_drive_csv(df: pd.DataFrame, name: str):
+    service = _drive_service()
+    folder_id = st.secrets["drive"]["folder_id"]
+    file_id = _find_file(service, name, folder_id)
+
+    out = df.copy()
+    if "Fecha" in out.columns:
+        out["Fecha"] = pd.to_datetime(out["Fecha"], errors="coerce").dt.strftime(CSV_DATE_FMT)
+    buf = io.BytesIO()
+    out.to_csv(buf, index=False)
+    buf.seek(0)
+
+    media = MediaIoBaseUpload(buf, mimetype="text/csv", resumable=True)
+    if file_id:
+        service.files().update(fileId=file_id, media_body=media).execute()
+    else:
+        meta = {"name": name, "parents": [folder_id], "mimeType": "text/csv"}
+        service.files().create(body=meta, media_body=media, fields="id").execute()
+    log(f"[Drive] {name} guardado. Filas: {len(df)}")
+
+def upload_to_drive_from_filelike(file, target_name: str):
+    """Sube un archivo CSV (file-like) a la carpeta, reemplazando si existe."""
+    service = _drive_service()
+    folder_id = st.secrets["drive"]["folder_id"]
+    file_id = _find_file(service, target_name, folder_id)
+    data = file.read()
+    buf = io.BytesIO(data)
+    buf.seek(0)
+    media = MediaIoBaseUpload(buf, mimetype="text/csv", resumable=True)
+    if file_id:
+        service.files().update(fileId=file_id, media_body=media).execute()
+    else:
+        meta = {"name": target_name, "parents": [folder_id], "mimeType": "text/csv"}
+        service.files().create(body=meta, media_body=media, fields="id").execute()
+    log(f"[Drive] Subida/replace de {target_name} OK.")
 
 # ============ HELPERS: FECHAS / CSV ============
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -170,28 +212,33 @@ def try_parse_month(x):
 
 def load_data(file, cols):
     if os.path.exists(file):
-        df = pd.read_csv(file)
-        df = normalize_columns(df)
-        for c in cols:
-            if c not in df.columns:
-                df[c] = 0.0 if c in ("Monto","Valor") else ""
-        if "Fecha" in df.columns:
-            df["Fecha"] = df["Fecha"].apply(try_parse_month)
-        return df[cols]
+        try:
+            df = pd.read_csv(file)
+            df = normalize_columns(df)
+            for c in cols:
+                if c not in df.columns:
+                    df[c] = 0.0 if c in ("Monto","Valor") else ""
+            if "Fecha" in df.columns:
+                df["Fecha"] = df["Fecha"].apply(try_parse_month)
+            log(f"[Local] {file} cargado. Filas: {len(df)}")
+            return df[cols]
+        except Exception as e:
+            log(f"ERROR leyendo {file}: {e}. Devuelvo DF vacío.")
+            return pd.DataFrame(columns=cols)
     else:
+        log(f"[Local] {file} no existe, DF vacío.")
         return pd.DataFrame(columns=cols)
 
 def save_data(df, file):
-    out = df.copy()
-    if "Fecha" in out.columns:
-        out["Fecha"] = pd.to_datetime(out["Fecha"], errors="coerce").dt.strftime(CSV_DATE_FMT)
-    out.to_csv(file, index=False)
-
-def df_to_bytes(df):
-    tmp = df.copy()
-    if "Fecha" in tmp.columns:
-        tmp["Fecha"] = pd.to_datetime(tmp["Fecha"], errors="coerce").dt.strftime(CSV_DATE_FMT)
-    return tmp.to_csv(index=False).encode("utf-8")
+    try:
+        out = df.copy()
+        if "Fecha" in out.columns:
+            out["Fecha"] = pd.to_datetime(out["Fecha"], errors="coerce").dt.strftime(CSV_DATE_FMT)
+        out.to_csv(file, index=False)
+        log(f"[Local] {file} guardado. Filas: {len(df)}")
+    except Exception as e:
+        log(f"ERROR guardando {file}: {e}")
+        raise
 
 # Funciones unificadas para usar SIEMPRE:
 def LOAD(file, cols):
@@ -205,6 +252,15 @@ def SAVE(df, file):
         return save_drive_csv(df, file)
     else:
         return save_data(df, file)
+
+def SAVE_SAFE(df, file, label: str = ""):
+    try:
+        SAVE(df, file)
+        st.success("✅ Cambios guardados.")
+        log(f"Guardado OK: {file}")
+    except Exception as e:
+        st.error(f"❌ Error guardando {label or file}: {e}")
+        log(f"ERROR guardando {file}: {e}")
 
 # ============ VALIDACIONES ============
 def validar_cuit(cuit: str) -> bool:
@@ -315,8 +371,7 @@ def show_table_editable(df, file, cols, select_options: Dict[str, list] = None):
             keep["Categoria"] = keep["Categoria"].where(keep["Categoria"].isin(select_options["Categoria"]), "")
 
         keep = keep[cols]
-        SAVE(keep, file)
-        st.success("✅ Cambios guardados.")
+        SAVE_SAFE(keep, file, label=os.path.basename(file))
         return keep
 
     c3.download_button(
@@ -327,6 +382,12 @@ def show_table_editable(df, file, cols, select_options: Dict[str, list] = None):
         use_container_width=True
     )
     return df
+
+def df_to_bytes(df):
+    tmp = df.copy()
+    if "Fecha" in tmp.columns:
+        tmp["Fecha"] = pd.to_datetime(tmp["Fecha"], errors="coerce").dt.strftime(CSV_DATE_FMT)
+    return tmp.to_csv(index=False).encode("utf-8")
 
 # ============ AGREGACIÓN / ORDEN / EJE COMPLETO ============
 def periodo_label(fecha: pd.Series, freq: str) -> pd.Series:
@@ -422,8 +483,8 @@ def agregar_proyeccion(comp_df: pd.DataFrame) -> pd.DataFrame:
       - Cum_Proyectado: hasta último período con Certificado>0 sigue Cum_Certificado;
         luego suma Estimado futuros (proyección).
       - Cum_Certificado_Masked: igual a Cum_Certificado hasta último real; NaN a futuro.
-      - Estimado_Proy: misma serie Estimado (para poder calcular variación vs proyección por período).
-      - Real_Proy_Periodo: contribución por período que genera Cum_Proyectado (diferencia de cumulado).
+      - Estimado_Proy: misma serie Estimado.
+      - Real_Proy_Periodo: contribución por período (real hasta último real; luego estimado).
     """
     if comp_df.empty:
         return comp_df.copy()
@@ -459,9 +520,8 @@ def agregar_proyeccion(comp_df: pd.DataFrame) -> pd.DataFrame:
     df["Estimado_Proy"] = df["Estimado"]
     df["Real_Proy_Periodo"] = real_proy_periodo
 
-    # Variación proyectada por período (Real proyectado - Estimado)
+    # Variaciones
     df["Variacion_Proy_Periodo"] = df["Real_Proy_Periodo"] - df["Estimado_Proy"]
-    # Variación proyectada acumulada
     df["Variacion_Proy_Acum"] = df["Cum_Proyectado"] - df["Cum_Estimado"]
     return df
 
@@ -610,17 +670,25 @@ def matriz_planilla(est_df, cer_df, freq, ordered_periods):
 
     return wide, tips
 
-# ====== SIDEBAR: ESTADO DE PERSISTENCIA + SUBIDA CSV ======
+# ====== SIDEBAR: ESTADO / DIAGNÓSTICO ======
 with st.sidebar.expander("🔐 Estado de almacenamiento", expanded=False):
     if USE_DRIVE:
         st.success("Persistencia: Google Drive (API).")
         st.caption("Los CSV viven en la carpeta de Drive configurada en secrets.")
     else:
-        if HAS_SECRETS:
+        if HAS_SECRETS and _DRIVE_IMPORT_ERROR:
+            st.warning(f"Secrets presentes, pero falló importar Google API: {_DRIVE_IMPORT_ERROR}. Usando CSV locales.")
+        elif HAS_SECRETS:
             st.warning("Secrets presentes pero Drive deshabilitado (revisá [drive.folder_id]). Usando CSV locales.")
         else:
-            st.info("Sin secrets: modo local (CSV en disco). En Streamlit Cloud, cargá los secrets para persistir en Drive.")
+            st.info("Sin secrets: modo local (CSV en disco).")
 
+with st.sidebar.expander("🧪 Diagnóstico (logs)", expanded=False):
+    logs_text = "\n".join(st.session_state.get("_logs", [])) or "Sin logs aún."
+    st.code(logs_text, language="text")
+    st.caption("Los logs también se envían a los Logs del servicio (stderr).")
+
+# ====== SUBIDA CSV ======
 def handle_csv_uploads():
     st.sidebar.markdown("### 📤 Cargar / Reemplazar CSV")
     st.sidebar.caption("Acepta: estimados.csv, certificaciones.csv, proveedores.csv, valor.csv")
@@ -641,26 +709,42 @@ def handle_csv_uploads():
         base = up.name.strip().lower()
         if base in name_map:
             target = name_map[base]
-            if USE_DRIVE:
-                upload_to_drive_from_filelike(up, target)
-            else:
-                with open(target, "wb") as f:
-                    f.write(up.getbuffer())
-            st.sidebar.success(f"Reemplazado: {base}")
-            touched = True
+            try:
+                if USE_DRIVE:
+                    upload_to_drive_from_filelike(up, target)
+                else:
+                    with open(target, "wb") as f:
+                        f.write(up.getbuffer())
+                st.sidebar.success(f"Reemplazado: {base}")
+                log(f"Upload OK: {base} -> {target}")
+                touched = True
+            except Exception as e:
+                st.sidebar.error(f"❌ Error subiendo {base}: {e}")
+                log(f"ERROR upload {base}: {e}")
         else:
             st.sidebar.warning(f"Ignorado {up.name} (nombre no reconocido).")
+            log(f"Ignorado upload {up.name}")
     if touched:
         st.sidebar.info("Datos actualizados desde los CSV subidos.")
         st.rerun()
 
 handle_csv_uploads()
 
-# ============ CARGA INICIAL ============
-estimados = LOAD(FILE_ESTIMADOS, ["Fecha","Monto","Proveedor","Descripcion","Comentario","Tipo","Categoria"])
-certificaciones = LOAD(FILE_CERTIFICACIONES, ["Fecha","Monto","Proveedor","Comentario","Tipo","Categoria"])
-proveedores = LOAD(FILE_PROVEEDORES, ["Proveedor","CUIT","Descripcion"])
-valor = LOAD(FILE_VALOR, ["Fecha","Valor","Comentario"])
+# ============ CARGA INICIAL (robusta) ============
+def SAFE_LOAD(file, cols, label):
+    try:
+        log(f"Cargando {label} desde {'Drive' if USE_DRIVE else 'local'}")
+        df = LOAD(file, cols)
+        return df
+    except Exception as e:
+        st.warning(f"No se pudo cargar {label}: {e}. Se usa tabla vacía.")
+        log(f"ERROR al cargar {label}: {e}")
+        return pd.DataFrame(columns=cols)
+
+estimados = SAFE_LOAD(FILE_ESTIMADOS, ["Fecha","Monto","Proveedor","Descripcion","Comentario","Tipo","Categoria"], "Estimados")
+certificaciones = SAFE_LOAD(FILE_CERTIFICACIONES, ["Fecha","Monto","Proveedor","Comentario","Tipo","Categoria"], "Certificaciones")
+proveedores = SAFE_LOAD(FILE_PROVEEDORES, ["Proveedor","CUIT","Descripcion"], "Proveedores")
+valor = SAFE_LOAD(FILE_VALOR, ["Fecha","Valor","Comentario"], "Valor")
 
 # ============ SIDEBAR ============
 st.sidebar.title("📌 Menú")
@@ -695,8 +779,7 @@ if menu == "Carga Estimado":
                 "Tipo": tipo, "Categoria": categoria
             }])
             estimados = pd.concat([estimados, nuevo], ignore_index=True)
-            SAVE(estimados, FILE_ESTIMADOS)
-            st.success("✅ Estimado guardado.")
+            SAVE_SAFE(estimados, FILE_ESTIMADOS, label="Estimados")
             st.rerun()
     st.divider(); st.subheader("📋 Estimados cargados")
     proveedor_opts = proveedores["Proveedor"].dropna().unique().tolist() if not proveedores.empty else []
@@ -738,8 +821,7 @@ elif menu == "Carga Certificación":
                 "Tipo": tipo, "Categoria": categoria
             }])
             certificaciones = pd.concat([certificaciones, nuevo], ignore_index=True)
-            SAVE(certificaciones, FILE_CERTIFICACIONES)
-            st.success("✅ Certificación guardada.")
+            SAVE_SAFE(certificaciones, FILE_CERTIFICACIONES, label="Certificaciones")
             st.rerun()
     st.divider(); st.subheader("📋 Certificaciones cargadas")
     proveedor_opts = proveedores["Proveedor"].dropna().unique().tolist() if not proveedores.empty else []
@@ -769,8 +851,7 @@ elif menu == "Carga Proveedor":
                 st.warning("⚠️ El CUIT no parece válido (checksum). Se guarda igual por ser opcional.")
             nuevo = pd.DataFrame([{"Proveedor":prov.strip(),"CUIT":(cuit or "").strip(),"Descripcion":(desc or "").strip()}])
             proveedores = pd.concat([proveedores, nuevo], ignore_index=True)
-            SAVE(proveedores, FILE_PROVEEDORES)
-            st.success("✅ Proveedor guardado.")
+            SAVE_SAFE(proveedores, FILE_PROVEEDORES, label="Proveedores")
             st.rerun()
     st.divider(); st.subheader("📋 Proveedores cargados")
     proveedores = show_table_editable(proveedores, FILE_PROVEEDORES, ["Proveedor","CUIT","Descripcion"])
@@ -788,8 +869,7 @@ elif menu == "Captura de Valor":
         if validar_obligatorios({"Fecha":fecha,"Valor":val_monto}):
             nuevo = pd.DataFrame([{"Fecha":fecha,"Valor":float(val_monto),"Comentario":(st.session_state.get("val_com") or "").strip()}])
             valor = pd.concat([valor, nuevo], ignore_index=True)
-            SAVE(valor, FILE_VALOR)
-            st.success("✅ Captura de Valor guardada.")
+            SAVE_SAFE(valor, FILE_VALOR, label="Valor")
             st.rerun()
     st.divider(); st.subheader("📋 Valores cargados")
     valor = show_table_editable(valor, FILE_VALOR, ["Fecha","Valor","Comentario"])
@@ -886,7 +966,7 @@ elif menu == "Reportes":
         col_cum_cer = c5.color_picker("Color Curva Real - Plan (Real)", ui["col_cum_cer"])
         bar_mode = c6.selectbox("Modo de barras", ["group","stack"], index=0 if ui["bar_mode"]=="group" else 1)
 
-        c7, c8, c9 = st.columns(3)
+        c7, c8, c9 = st.columns(3)  # <- FIX: c7 (no 'googlc7')
         yscale = c7.selectbox("Escala Y", ["linear","log"], index=0 if ui["yscale"]=="linear" else 1)
         y_min = float(c8.number_input("Y mínimo", value=float(ui["y_min"]), step=1000.0))
         y_max = float(c9.number_input("Y máximo", value=float(ui["y_max"]), step=1000.0))
@@ -997,7 +1077,7 @@ elif menu == "Reportes":
                                             yscale=yscale, yrange=yrange, barmode=bar_mode)
                 st.plotly_chart(fig, use_container_width=True)
 
-                # Variación: hasta hoy vs estimado; a futuro vs proyectado acumulado (informativo en texto)
+                # Variación: hasta hoy vs estimado
                 cum_est_hoy, cum_real_hoy, delta_hoy = diferencia_hoy(comp, ord_comp, freq)
                 cH1, cH2, cH3 = st.columns(3)
                 cH1.metric("Estimado acumulado (hoy)", f"${cum_est_hoy:,.0f}")
@@ -1033,7 +1113,7 @@ elif menu == "Reportes":
                                              yscale=yscale, yrange=yrange)
                 st.plotly_chart(figS, use_container_width=True)
 
-                # Indicadores al día de hoy (sobre comp normal) y al final del rango con proyección
+                # Indicadores
                 cum_est_hoy, cum_real_hoy, delta_hoy = diferencia_hoy(comp, ord_comp, freq)
                 delta_final_proj = float(dfp["Cum_Proyectado"].iloc[-1] - dfp["Cum_Estimado"].iloc[-1])
                 cH1, cH2, cH3 = st.columns(3)
@@ -1169,6 +1249,7 @@ elif menu == "Reportes":
             st.info("No hay datos para la planilla con los filtros aplicados.")
 
                                       
+
 
 
    
