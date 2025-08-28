@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: wapp-mbc
+    runtime: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: bash start.sh
+    autoDeploy: true
+    envVars:
+      - key: GCP_PROJECT_ID
+        sync: false
+      - key: GCP_PRIVATE_KEY_ID
+        sync: false
+      - key: GCP_PRIVATE_KEY
+        sync: false
+      - key: GCP_CLIENT_EMAIL
+        sync: false
+      - key: GCP_CLIENT_ID
+        sync: false
+      - key: DRIVE_FOLDER_ID
+        sync: false
