@@ -27,9 +27,9 @@ def log(msg: str):
         pass
 
 # Mostrar siempre algo rápido para evitar “pantalla en blanco”
-st.set_page_config(page_title="📊 Gestión de Flujos", layout="wide")
-st.title("📊 Gestión de Flujos Financieros")
-st.caption("✅ checkpoint: front levantó")
+st.set_page_config(page_title="📊 Mantenimiento Basado en Condicion", layout="wide")
+st.title("📊 Gestión Financieros de MBC")
+st.caption("Seguimiento de flujos")
 st.set_option("client.showErrorDetails", True)
 log("UI inicial pintada.")
 
@@ -1256,4 +1256,5 @@ elif menu == "Reportes":
 
 
    
+
 
