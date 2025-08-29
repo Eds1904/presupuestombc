@@ -68,7 +68,7 @@ def save_prefs(path: str, prefs: Dict) -> None:
 # ====== PERSISTENCIA EN GOOGLE DRIVE (CSV) con fallback local ======
 # Detectar si hay secrets (evita crash local)
 try:
-    HAS_SECRETS = bool(st.secrets)
+    HAS_SECRETS = len(getattr(st, "secrets", {})) > 0
 except Exception:
     HAS_SECRETS = False
 
@@ -1248,8 +1248,12 @@ elif menu == "Reportes":
         else:
             st.info("No hay datos para la planilla con los filtros aplicados.")
 
+
                                       
 
 
+   
+
 
    
+
